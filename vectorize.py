@@ -1,174 +1,246 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
-from rasterio.rio.helpers import coords
-from skan import Skeleton
+from numba import njit
 from .pixel_graph import neighborhood_pixel_graph
 
-def vectorize(img):
+
+def vectorize(img, return_flat=False):
     """
-    Возвращает только список ломаных линий.
+    Возвращает список ломаных линий:
+        [np.array([[x, y], ...]), ...]
 
-    Формат:
-        lines = [
-            np.array([[x1, y1], [x2, y2], ...]),
-            np.array([[x1, y1], [x2, y2], ...]),
-            ...
-        ]
+    Если return_flat=True, возвращает:
+        points_xy, offsets
 
-    Здесь:
-        x = col
-        y = row
-
-    Ломаная строится от одного важного узла до другого.
-    Важный узел — это:
-        - конец линии, degree == 1
-        - развилка, degree >= 3
-        - изолированная точка, degree == 0
-
-    Узлы с degree == 2 считаются промежуточными точками ломаной.
+    где линия i:
+        points_xy[offsets[i]:offsets[i + 1]]
     """
 
     image_thin = img > 0
 
-    if not np.any(image_thin):
+    if not image_thin.any():
+        if return_flat:
+            return (
+                np.empty((0, 2), dtype=np.float64),
+                np.array([0], dtype=np.int64),
+            )
+
         return []
+
+    import time
+    start_time = time.perf_counter()
     graph, coords = neighborhood_pixel_graph(image_thin.astype(bool))
+    elapsed_time = time.perf_counter() - start_time
+    graph = graph.tocsr()
+    print("тест основного алгоритма", elapsed_time)
+
     graph = graph.tocsr()
 
     node_count = graph.shape[0]
 
     if node_count == 0:
+        if return_flat:
+            return (
+                np.empty((0, 2), dtype=np.float64),
+                np.array([0], dtype=np.int64),
+            )
+
         return []
 
-    degrees = np.asarray(graph.astype(bool).sum(axis=1)).ravel()
+    indptr = graph.indptr
+    indices = graph.indices
 
-    # adjacency[i] = список соседей узла i
-    adjacency = []
-    for i in range(node_count):
-        start = graph.indptr[i]
-        end = graph.indptr[i + 1]
-        adjacency.append(graph.indices[start:end].tolist())
+    degrees = np.diff(indptr)
 
-    # Важные узлы: концы, развилки, изолированные точки
-    important_nodes = set(np.where(degrees != 2)[0].tolist())
+    important_mask = degrees != 2
 
-    visited_edges = set()
-    lines = []
+    flat_nodes, offsets = _trace_paths_numba(
+        indptr,
+        indices,
+        degrees,
+        important_mask,
+    )
 
-    def edge_key(a, b):
-        return tuple(sorted((int(a), int(b))))
+    # coords хранит [row, col]
+    # Нужно [x, y] = [col, row]
+    rc = coords[flat_nodes]
 
-    def nodes_to_xy_line(path_nodes):
-        """
-        Преобразует индексы узлов Skeleton в np.array([[x, y], ...]).
-        sk.coordinates хранит [row, col], а для matplotlib нужно [x, y] = [col, row].
-        """
-        line = []
+    # Если float не нужен, лучше оставить int:
+    # points_xy = rc[:, ::-1].copy()
+    points_xy = rc[:, ::-1].astype(np.float64, copy=True)
 
-        for node_idx in path_nodes:
-            row, col = coords[node_idx]
-            line.append([col, row])
+    if return_flat:
+        return points_xy, offsets
 
-        return np.asarray(line, dtype=float)
+    lines = [
+        points_xy[offsets[i]:offsets[i + 1]]
+        for i in range(offsets.size - 1)
+    ]
 
-    # Случай изолированных точек
-    for node in important_nodes:
-        if degrees[node] == 0:
-            lines.append(nodes_to_xy_line([node]))
+    return lines
 
-    # Обычный случай: идём от важного узла до следующего важного узла
-    for start_node in important_nodes:
-        for next_node in adjacency[start_node]:
-            key = edge_key(start_node, next_node)
 
-            if key in visited_edges:
+@njit(cache=True)
+def _mark_reverse_edge(indptr, indices, visited, a, b):
+    """
+    Отмечает обратное ребро b -> a.
+
+    Для пиксельного графа степень малая, обычно <= 8,
+    поэтому линейный поиск по соседям дешёвый.
+    """
+    start = indptr[b]
+    end = indptr[b + 1]
+
+    for q in range(start, end):
+        if indices[q] == a:
+            visited[q] = 1
+            return
+
+
+@njit(cache=True)
+def _trace_paths_numba(indptr, indices, degrees, important_mask):
+    """
+    Возвращает:
+        flat_nodes: плоский массив индексов узлов
+        offsets: границы линий в flat_nodes
+
+    Линия i:
+        flat_nodes[offsets[i]:offsets[i + 1]]
+    """
+
+    node_count = degrees.shape[0]
+    edge_ref_count = indices.shape[0]
+
+    visited = np.zeros(edge_ref_count, dtype=np.uint8)
+
+    # В CSR неориентированное ребро обычно хранится дважды.
+    # edge_ref_count ~= 2 * edge_count.
+    #
+    # Суммарное число узлов во всех ломаных <= edge_count + line_count.
+    # Безопасный запас: edge_ref_count + node_count + 1.
+    max_flat_nodes = edge_ref_count + node_count + 1
+    max_lines = edge_ref_count + node_count + 1
+
+    flat_nodes = np.empty(max_flat_nodes, dtype=np.int64)
+    offsets = np.empty(max_lines + 1, dtype=np.int64)
+
+    flat_count = 0
+    line_count = 0
+    offsets[0] = 0
+
+    # 1. Изолированные точки
+    for node in range(node_count):
+        if important_mask[node] and degrees[node] == 0:
+            flat_nodes[flat_count] = node
+            flat_count += 1
+
+            line_count += 1
+            offsets[line_count] = flat_count
+
+    # 2. Обычные линии: от важного узла до важного узла
+    for start_node in range(node_count):
+        if not important_mask[start_node]:
+            continue
+
+        nb_start = indptr[start_node]
+        nb_end = indptr[start_node + 1]
+
+        for p in range(nb_start, nb_end):
+            if visited[p] != 0:
                 continue
 
-            path = [start_node]
+            next_node = indices[p]
+
+            flat_nodes[flat_count] = start_node
+            flat_count += 1
 
             prev_node = start_node
             current_node = next_node
 
-            visited_edges.add(key)
+            visited[p] = 1
+            _mark_reverse_edge(indptr, indices, visited, start_node, current_node)
 
             while True:
-                path.append(current_node)
+                flat_nodes[flat_count] = current_node
+                flat_count += 1
 
-                # Дошли до конца или развилки
-                if current_node in important_nodes:
+                if important_mask[current_node]:
                     break
 
-                neighbours = adjacency[current_node]
+                # current_node не важный, значит degree == 2
+                p0 = indptr[current_node]
+                p1 = p0 + 1
 
-                # Ищем следующий узел, кроме того, откуда пришли
-                candidates = [
-                    node for node in neighbours
-                    if node != prev_node
-                ]
+                if indices[p0] != prev_node:
+                    p_next = p0
+                else:
+                    p_next = p1
 
-                if not candidates:
+                if visited[p_next] != 0:
                     break
 
-                # Для degree == 2 тут должен быть ровно один кандидат
-                new_node = candidates[0]
-                key = edge_key(current_node, new_node)
+                new_node = indices[p_next]
 
-                if key in visited_edges:
-                    break
-
-                visited_edges.add(key)
+                visited[p_next] = 1
+                _mark_reverse_edge(indptr, indices, visited, current_node, new_node)
 
                 prev_node = current_node
                 current_node = new_node
 
-            lines.append(nodes_to_xy_line(path))
+            line_count += 1
+            offsets[line_count] = flat_count
 
-    # Отдельный случай: замкнутый цикл, где у всех узлов degree == 2
-    # Например, кольцо без концов и развилок.
-    if not important_nodes:
-        for start_node in range(node_count):
-            for next_node in adjacency[start_node]:
-                key = edge_key(start_node, next_node)
+    # 3. Остаточные циклы.
+    # Важно: это ловит кольца даже если в изображении есть и обычные линии тоже.
+    for start_node in range(node_count):
+        nb_start = indptr[start_node]
+        nb_end = indptr[start_node + 1]
 
-                if key in visited_edges:
-                    continue
+        for p in range(nb_start, nb_end):
+            if visited[p] != 0:
+                continue
 
-                path = [start_node]
+            next_node = indices[p]
 
-                prev_node = start_node
-                current_node = next_node
+            flat_nodes[flat_count] = start_node
+            flat_count += 1
 
-                visited_edges.add(key)
+            prev_node = start_node
+            current_node = next_node
 
-                while True:
-                    path.append(current_node)
+            visited[p] = 1
+            _mark_reverse_edge(indptr, indices, visited, start_node, current_node)
 
-                    if current_node == start_node:
-                        break
+            while True:
+                flat_nodes[flat_count] = current_node
+                flat_count += 1
 
-                    neighbours = adjacency[current_node]
+                if current_node == start_node:
+                    break
 
-                    candidates = [
-                        node for node in neighbours
-                        if node != prev_node
-                    ]
+                if degrees[current_node] != 2:
+                    break
 
-                    if not candidates:
-                        break
+                p0 = indptr[current_node]
+                p1 = p0 + 1
 
-                    new_node = candidates[0]
-                    key = edge_key(current_node, new_node)
+                if indices[p0] != prev_node:
+                    p_next = p0
+                else:
+                    p_next = p1
 
-                    if key in visited_edges:
-                        break
+                if visited[p_next] != 0:
+                    break
 
-                    visited_edges.add(key)
+                new_node = indices[p_next]
 
-                    prev_node = current_node
-                    current_node = new_node
+                visited[p_next] = 1
+                _mark_reverse_edge(indptr, indices, visited, current_node, new_node)
 
-                lines.append(nodes_to_xy_line(path))
+                prev_node = current_node
+                current_node = new_node
 
-    return lines
+            line_count += 1
+            offsets[line_count] = flat_count
+
+    return flat_nodes[:flat_count], offsets[:line_count + 1]
 
