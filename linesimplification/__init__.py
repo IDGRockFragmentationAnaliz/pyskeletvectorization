@@ -1,0 +1,1 @@
+from .douglas_peucker import simplify_line_douglas_peucker as douglas_peucker
