@@ -6,10 +6,12 @@ from .simplify_links import SIMPLE_MASK
 
 
 def neighborhood_pixel_graph(image, simplify=True):
+    import time
+
+    t = time.perf_counter()
     nodes, bit_neighborhood = _build_bit_neighborhood(image)
     if simplify:
         bit_neighborhood = SIMPLE_MASK[bit_neighborhood]
-
 
     neighbor_offsets = raveled_offsets_c8(image.shape)
     point_start, points_end = get_links(nodes, bit_neighborhood, neighbor_offsets)
@@ -23,7 +25,9 @@ def neighborhood_pixel_graph(image, simplify=True):
     assert_symmetric_graph(graph)
     coordinates = np.column_stack(np.unravel_index(nodes, image.shape))
 
+
     return graph, coordinates
+
 
 def assert_symmetric_graph(graph):
     """
@@ -53,7 +57,7 @@ def popcount_u8(x):
     return c
 
 
-@njit
+@njit(cache=True)
 def get_links(nodes, bit_neighborhood, neighbor_offsets):
     total_links = 0
 
@@ -83,45 +87,37 @@ def get_links(nodes, bit_neighborhood, neighbor_offsets):
 
 
 def _build_bit_neighborhood(mask: np.ndarray):
-    """
-        Нумерация соседей:
-
-        [3 2 1]
-        [4 x 0]
-        [5 6 7]
-    """
-    mask = mask.astype(bool)
-    padded = np.pad(mask, 1, mode='constant', constant_values=False)
-
-    views = _build_views3x3(mask)
+    mask = mask.astype(bool, copy=False)
+    h, w = mask.shape
+    padded = np.pad(mask, 1, mode="constant", constant_values=False)
+    padded = padded.ravel()
     nodes = np.flatnonzero(mask)
-    bit_neighborhood = np.zeros_like(nodes, dtype=np.uint8)
-    bit_offsets = [
-        (0, 1),  # bit 0: right
-        (-1, 1),  # bit 1: up-right
-        (-1, 0),  # bit 2: up
-        (-1, -1),  # bit 3: up-left
-        (0, -1),  # bit 4: left
-        (1, -1),  # bit 5: down-left
-        (1, 0),  # bit 6: down
-        (1, 1),  # bit 7: down-right
-    ]
-    for bit_id, offset in enumerate(bit_offsets):
-        neighbor_view = views[offset]
-        neighbor_values = neighbor_view.ravel()[nodes]
-        bit_neighborhood |= neighbor_values.astype(np.uint8) << bit_id
-
-    return nodes, bit_neighborhood
+    nodes = nodes.astype(np.int64, copy=False)
+    w = np.int64(w)
+    nodes_padded = nodes + np.int64(2) * (nodes // w) + (w + np.int64(3))
+    bitmask = get_neighborhood(nodes_padded, padded, w + np.int64(2))
+    return nodes, bitmask
 
 
-def _build_views3x3(image):
-    offsets_3x3 = [(dy, dx) for dy in range(-1, 2) for dx in range(-1, 2)]
-    view = {}
-    padded = np.pad(image, 1, mode='constant', constant_values=False)
-    h, w = image.shape
-    for dy, dx in offsets_3x3:
-        view[(dy, dx)] = padded[
-            1 + dy : 1 + dy + h,
-            1 + dx : 1 + dx + w
-        ]
-    return view
+@njit(cache=True)
+def get_neighborhood(nodes, image, w):
+    n = nodes.size
+    bit_neighborhood = np.empty(n, dtype=np.uint8)
+
+    for i in range(n):
+        node = nodes[i]
+
+        bitmask = np.uint8(0)
+
+        bitmask |= np.uint8(image[node + 1]) << 0
+        bitmask |= np.uint8(image[node - w + 1]) << 1
+        bitmask |= np.uint8(image[node - w]) << 2
+        bitmask |= np.uint8(image[node - w - 1]) << 3
+        bitmask |= np.uint8(image[node - 1]) << 4
+        bitmask |= np.uint8(image[node + w - 1]) << 5
+        bitmask |= np.uint8(image[node + w]) << 6
+        bitmask |= np.uint8(image[node + w + 1]) << 7
+
+        bit_neighborhood[i] = bitmask
+
+    return bit_neighborhood

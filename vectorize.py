@@ -15,7 +15,7 @@ def vectorize(img, return_flat=False):
         points_xy[offsets[i]:offsets[i + 1]]
     """
 
-    image_thin = img > 0
+    image_thin = img.astype(bool, copy=True)
 
     if not image_thin.any():
         if return_flat:
@@ -26,15 +26,8 @@ def vectorize(img, return_flat=False):
 
         return []
 
-    import time
-    start_time = time.perf_counter()
     graph, coords = neighborhood_pixel_graph(image_thin.astype(bool))
-    elapsed_time = time.perf_counter() - start_time
     graph = graph.tocsr()
-    print("тест основного алгоритма", elapsed_time)
-
-    graph = graph.tocsr()
-
     node_count = graph.shape[0]
 
     if node_count == 0:
@@ -65,8 +58,8 @@ def vectorize(img, return_flat=False):
     rc = coords[flat_nodes]
 
     # Если float не нужен, лучше оставить int:
-    # points_xy = rc[:, ::-1].copy()
-    points_xy = rc[:, ::-1].astype(np.float64, copy=True)
+    points_xy = rc[:, ::-1].copy()
+    #points_xy = rc[:, ::-1].astype(np.float64, copy=True)
 
     if return_flat:
         return points_xy, offsets
