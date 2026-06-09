@@ -1,8 +1,9 @@
 import numpy as np
 from numba import njit
-from .pixel_graph import neighborhood_pixel_graph
+from .pixel_graph import pixel_graph
 
-
+#Douglas–Peucker
+#Visvalingam–Whyatt
 def vectorize(img, return_flat=False):
     """
     Возвращает список ломаных линий:
@@ -26,7 +27,7 @@ def vectorize(img, return_flat=False):
 
         return []
 
-    graph, coords = neighborhood_pixel_graph(image_thin.astype(bool))
+    graph, coords = pixel_graph(image_thin.astype(bool))
     graph = graph.tocsr()
     node_count = graph.shape[0]
 
