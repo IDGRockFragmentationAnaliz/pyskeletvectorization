@@ -1,10 +1,10 @@
 import numpy as np
 from numba import njit
 from .pixel_graph import pixel_graph
+from .linesimplification import douglas_peucker_inplace
 
-#Douglas–Peucker
-#Visvalingam–Whyatt
-def vectorize(img, return_flat=False):
+
+def vectorize(img, return_flat=False, simplify_tolerance=1.0):
     """
     Возвращает список ломаных линий:
         [np.array([[x, y], ...]), ...]
@@ -14,6 +14,10 @@ def vectorize(img, return_flat=False):
 
     где линия i:
         points_xy[offsets[i]:offsets[i + 1]]
+
+    simplify_tolerance:
+        0.0 — без упрощения.
+        > 0.0 — Douglas–Peucker на лету после построения каждой линии.
     """
 
     image_thin = img.astype(bool, copy=True)
@@ -44,23 +48,16 @@ def vectorize(img, return_flat=False):
     indices = graph.indices
 
     degrees = np.diff(indptr)
-
     important_mask = degrees != 2
 
-    flat_nodes, offsets = _trace_paths_numba(
+    points_xy, offsets = _trace_paths_numba(
         indptr,
         indices,
         degrees,
         important_mask,
+        coords,
+        float(simplify_tolerance),
     )
-
-    # coords хранит [row, col]
-    # Нужно [x, y] = [col, row]
-    rc = coords[flat_nodes]
-
-    # Если float не нужен, лучше оставить int:
-    points_xy = rc[:, ::-1].copy()
-    #points_xy = rc[:, ::-1].astype(np.float64, copy=True)
 
     if return_flat:
         return points_xy, offsets
@@ -91,14 +88,69 @@ def _mark_reverse_edge(indptr, indices, visited, a, b):
 
 
 @njit(cache=True)
-def _trace_paths_numba(indptr, indices, degrees, important_mask):
+def _append_node_point(points_xy, flat_count, coords, node):
+    """
+    coords хранит [row, col].
+    points_xy хранит [x, y] = [col, row].
+    """
+    points_xy[flat_count, 0] = coords[node, 1]
+    points_xy[flat_count, 1] = coords[node, 0]
+
+    return flat_count + 1
+
+
+@njit(cache=True)
+def _finish_line(
+    points_xy,
+    flat_count,
+    offsets,
+    line_count,
+    line_start,
+    simplify_tolerance,
+):
+    """
+    Завершает текущую линию.
+
+    Если simplify_tolerance > 0:
+        упрощает points_xy[line_start:flat_count] на месте
+        и откатывает flat_count к новой длине.
+
+    Если simplify_tolerance <= 0:
+        ничего не упрощает.
+    """
+
+    if simplify_tolerance > 0.0:
+        line = points_xy[line_start:flat_count]
+
+        new_len = douglas_peucker_inplace(
+            line,
+            simplify_tolerance,
+        )
+
+        flat_count = line_start + new_len
+
+    line_count += 1
+    offsets[line_count] = flat_count
+
+    return flat_count, line_count
+
+
+@njit(cache=True)
+def _trace_paths_numba(
+    indptr,
+    indices,
+    degrees,
+    important_mask,
+    coords,
+    simplify_tolerance,
+):
     """
     Возвращает:
-        flat_nodes: плоский массив индексов узлов
-        offsets: границы линий в flat_nodes
+        points_xy: плоский массив координат всех линий
+        offsets: границы линий в points_xy
 
     Линия i:
-        flat_nodes[offsets[i]:offsets[i + 1]]
+        points_xy[offsets[i]:offsets[i + 1]]
     """
 
     node_count = degrees.shape[0]
@@ -109,12 +161,12 @@ def _trace_paths_numba(indptr, indices, degrees, important_mask):
     # В CSR неориентированное ребро обычно хранится дважды.
     # edge_ref_count ~= 2 * edge_count.
     #
-    # Суммарное число узлов во всех ломаных <= edge_count + line_count.
+    # Суммарное число точек во всех ломаных <= edge_count + line_count.
     # Безопасный запас: edge_ref_count + node_count + 1.
-    max_flat_nodes = edge_ref_count + node_count + 1
+    max_flat_points = edge_ref_count + node_count + 1
     max_lines = edge_ref_count + node_count + 1
 
-    flat_nodes = np.empty(max_flat_nodes, dtype=np.int64)
+    points_xy = np.empty((max_flat_points, 2), dtype=coords.dtype)
     offsets = np.empty(max_lines + 1, dtype=np.int64)
 
     flat_count = 0
@@ -124,11 +176,23 @@ def _trace_paths_numba(indptr, indices, degrees, important_mask):
     # 1. Изолированные точки
     for node in range(node_count):
         if important_mask[node] and degrees[node] == 0:
-            flat_nodes[flat_count] = node
-            flat_count += 1
+            line_start = flat_count
 
-            line_count += 1
-            offsets[line_count] = flat_count
+            flat_count = _append_node_point(
+                points_xy,
+                flat_count,
+                coords,
+                node,
+            )
+
+            flat_count, line_count = _finish_line(
+                points_xy,
+                flat_count,
+                offsets,
+                line_count,
+                line_start,
+                simplify_tolerance,
+            )
 
     # 2. Обычные линии: от важного узла до важного узла
     for start_node in range(node_count):
@@ -144,18 +208,34 @@ def _trace_paths_numba(indptr, indices, degrees, important_mask):
 
             next_node = indices[p]
 
-            flat_nodes[flat_count] = start_node
-            flat_count += 1
+            line_start = flat_count
+
+            flat_count = _append_node_point(
+                points_xy,
+                flat_count,
+                coords,
+                start_node,
+            )
 
             prev_node = start_node
             current_node = next_node
 
             visited[p] = 1
-            _mark_reverse_edge(indptr, indices, visited, start_node, current_node)
+            _mark_reverse_edge(
+                indptr,
+                indices,
+                visited,
+                start_node,
+                current_node,
+            )
 
             while True:
-                flat_nodes[flat_count] = current_node
-                flat_count += 1
+                flat_count = _append_node_point(
+                    points_xy,
+                    flat_count,
+                    coords,
+                    current_node,
+                )
 
                 if important_mask[current_node]:
                     break
@@ -175,13 +255,25 @@ def _trace_paths_numba(indptr, indices, degrees, important_mask):
                 new_node = indices[p_next]
 
                 visited[p_next] = 1
-                _mark_reverse_edge(indptr, indices, visited, current_node, new_node)
+                _mark_reverse_edge(
+                    indptr,
+                    indices,
+                    visited,
+                    current_node,
+                    new_node,
+                )
 
                 prev_node = current_node
                 current_node = new_node
 
-            line_count += 1
-            offsets[line_count] = flat_count
+            flat_count, line_count = _finish_line(
+                points_xy,
+                flat_count,
+                offsets,
+                line_count,
+                line_start,
+                simplify_tolerance,
+            )
 
     # 3. Остаточные циклы.
     # Важно: это ловит кольца даже если в изображении есть и обычные линии тоже.
@@ -195,18 +287,34 @@ def _trace_paths_numba(indptr, indices, degrees, important_mask):
 
             next_node = indices[p]
 
-            flat_nodes[flat_count] = start_node
-            flat_count += 1
+            line_start = flat_count
+
+            flat_count = _append_node_point(
+                points_xy,
+                flat_count,
+                coords,
+                start_node,
+            )
 
             prev_node = start_node
             current_node = next_node
 
             visited[p] = 1
-            _mark_reverse_edge(indptr, indices, visited, start_node, current_node)
+            _mark_reverse_edge(
+                indptr,
+                indices,
+                visited,
+                start_node,
+                current_node,
+            )
 
             while True:
-                flat_nodes[flat_count] = current_node
-                flat_count += 1
+                flat_count = _append_node_point(
+                    points_xy,
+                    flat_count,
+                    coords,
+                    current_node,
+                )
 
                 if current_node == start_node:
                     break
@@ -228,13 +336,24 @@ def _trace_paths_numba(indptr, indices, degrees, important_mask):
                 new_node = indices[p_next]
 
                 visited[p_next] = 1
-                _mark_reverse_edge(indptr, indices, visited, current_node, new_node)
+                _mark_reverse_edge(
+                    indptr,
+                    indices,
+                    visited,
+                    current_node,
+                    new_node,
+                )
 
                 prev_node = current_node
                 current_node = new_node
 
-            line_count += 1
-            offsets[line_count] = flat_count
+            flat_count, line_count = _finish_line(
+                points_xy,
+                flat_count,
+                offsets,
+                line_count,
+                line_start,
+                simplify_tolerance,
+            )
 
-    return flat_nodes[:flat_count], offsets[:line_count + 1]
-
+    return points_xy[:flat_count].copy(), offsets[:line_count + 1].copy()
