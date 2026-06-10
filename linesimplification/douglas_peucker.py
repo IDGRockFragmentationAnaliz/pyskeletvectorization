@@ -7,12 +7,13 @@ def simplify_line_douglas_peucker(points_xy, tolerance):
     """
     Упрощает одну ломаную Douglas–Peucker.
 
+    Не меняет входной массив.
+
     points_xy:
         np.ndarray shape=(N, 2)
 
     tolerance:
         допуск в тех же единицах, что и координаты.
-        Для пиксельных координат — в пикселях.
 
     Возвращает:
         np.ndarray shape=(M, 2)
@@ -29,74 +30,16 @@ def simplify_line_douglas_peucker(points_xy, tolerance):
     tolerance_sq = tolerance * tolerance
 
     keep = np.zeros(n, dtype=np.uint8)
-
     stack_left = np.empty(n, dtype=np.int64)
     stack_right = np.empty(n, dtype=np.int64)
 
-    is_closed = (
-        n > 3
-        and points_xy[0, 0] == points_xy[n - 1, 0]
-        and points_xy[0, 1] == points_xy[n - 1, 1]
+    _dp_mark_keep(
+        points_xy,
+        keep,
+        tolerance_sq,
+        stack_left,
+        stack_right,
     )
-
-    if is_closed:
-        # Если линия замкнута, первая и последняя точки совпадают.
-        # Нельзя просто запускать DP от первой до последней:
-        # получится вырожденный отрезок нулевой длины.
-        #
-        # Поэтому ищем точку, максимально удалённую от стартовой,
-        # и разбиваем кольцо на две обычные открытые ломаные:
-        # 0 -> split и split -> n - 1.
-
-        sx = points_xy[0, 0]
-        sy = points_xy[0, 1]
-
-        max_dist_sq = -1.0
-        split_idx = 1
-
-        for i in range(1, n - 1):
-            dx = float(points_xy[i, 0]) - float(sx)
-            dy = float(points_xy[i, 1]) - float(sy)
-            dist_sq = dx * dx + dy * dy
-
-            if dist_sq > max_dist_sq:
-                max_dist_sq = dist_sq
-                split_idx = i
-
-        if split_idx > 0:
-            _dp_mark_range(
-                points_xy,
-                keep,
-                0,
-                split_idx,
-                tolerance_sq,
-                stack_left,
-                stack_right,
-            )
-
-            _dp_mark_range(
-                points_xy,
-                keep,
-                split_idx,
-                n - 1,
-                tolerance_sq,
-                stack_left,
-                stack_right,
-            )
-
-        keep[0] = 1
-        keep[n - 1] = 1
-
-    else:
-        _dp_mark_range(
-            points_xy,
-            keep,
-            0,
-            n - 1,
-            tolerance_sq,
-            stack_left,
-            stack_right,
-        )
 
     out_count = 0
 
@@ -116,44 +59,133 @@ def simplify_line_douglas_peucker(points_xy, tolerance):
 
     return simplified
 
+
 @njit(cache=True)
-def _point_segment_distance_sq(px, py, ax, ay, bx, by):
-    ax = float(ax)
-    ay = float(ay)
-    bx = float(bx)
-    by = float(by)
-    px = float(px)
-    py = float(py)
+def simplify_line_douglas_peucker_inplace(points_xy, tolerance):
+    """
+    Упрощает одну ломаную Douglas–Peucker на месте.
 
-    dx = bx - ax
-    dy = by - ay
+    points_xy:
+        np.ndarray shape=(N, 2)
 
-    denom = dx * dx + dy * dy
+    После вызова результат лежит в:
+        points_xy[:new_len]
 
-    if denom == 0.0:
-        ddx = px - ax
-        ddy = py - ay
-        return ddx * ddx + ddy * ddy
+    Возвращает:
+        new_len
+    """
 
-    t = ((px - ax) * dx + (py - ay) * dy) / denom
+    n = points_xy.shape[0]
 
-    if t <= 0.0:
-        ddx = px - ax
-        ddy = py - ay
-        return ddx * ddx + ddy * ddy
+    if n <= 2:
+        return n
 
-    if t >= 1.0:
-        ddx = px - bx
-        ddy = py - by
-        return ddx * ddx + ddy * ddy
+    if tolerance <= 0.0:
+        return n
 
-    proj_x = ax + t * dx
-    proj_y = ay + t * dy
+    tolerance_sq = tolerance * tolerance
 
-    ddx = px - proj_x
-    ddy = py - proj_y
+    keep = np.zeros(n, dtype=np.uint8)
+    stack_left = np.empty(n, dtype=np.int64)
+    stack_right = np.empty(n, dtype=np.int64)
 
-    return ddx * ddx + ddy * ddy
+    _dp_mark_keep(
+        points_xy,
+        keep,
+        tolerance_sq,
+        stack_left,
+        stack_right,
+    )
+
+    write_pos = 0
+
+    for read_pos in range(n):
+        if keep[read_pos] != 0:
+            points_xy[write_pos, 0] = points_xy[read_pos, 0]
+            points_xy[write_pos, 1] = points_xy[read_pos, 1]
+            write_pos += 1
+
+    return write_pos
+
+
+@njit(cache=True)
+def _dp_mark_keep(points_xy, keep, tolerance_sq, stack_left, stack_right):
+    """
+    Общая логика Douglas–Peucker.
+
+    Заполняет keep:
+        keep[i] == 1 — точку оставить
+        keep[i] == 0 — точку удалить
+
+    Ничего не аллоцирует.
+    Ничего не возвращает.
+    """
+
+    n = points_xy.shape[0]
+
+    for i in range(n):
+        keep[i] = 0
+
+    is_closed = (
+        n > 3
+        and points_xy[0, 0] == points_xy[n - 1, 0]
+        and points_xy[0, 1] == points_xy[n - 1, 1]
+    )
+
+    if is_closed:
+        if n <= 4:
+            for i in range(n):
+                keep[i] = 1
+            return
+
+        sx = points_xy[0, 0]
+        sy = points_xy[0, 1]
+
+        max_dist_sq = -1.0
+        split_idx = 1
+
+        for i in range(1, n - 1):
+            dx = float(points_xy[i, 0]) - float(sx)
+            dy = float(points_xy[i, 1]) - float(sy)
+            dist_sq = dx * dx + dy * dy
+
+            if dist_sq > max_dist_sq:
+                max_dist_sq = dist_sq
+                split_idx = i
+
+        _dp_mark_range(
+            points_xy,
+            keep,
+            0,
+            split_idx,
+            tolerance_sq,
+            stack_left,
+            stack_right,
+        )
+
+        _dp_mark_range(
+            points_xy,
+            keep,
+            split_idx,
+            n - 1,
+            tolerance_sq,
+            stack_left,
+            stack_right,
+        )
+
+        keep[0] = 1
+        keep[n - 1] = 1
+
+    else:
+        _dp_mark_range(
+            points_xy,
+            keep,
+            0,
+            n - 1,
+            tolerance_sq,
+            stack_left,
+            stack_right,
+        )
 
 
 @njit(cache=True)
@@ -208,3 +240,43 @@ def _dp_mark_range(points_xy, keep, first, last, tolerance_sq, stack_left, stack
             stack_left[stack_size] = max_idx
             stack_right[stack_size] = right
             stack_size += 1
+
+
+@njit(cache=True)
+def _point_segment_distance_sq(px, py, ax, ay, bx, by):
+    ax = float(ax)
+    ay = float(ay)
+    bx = float(bx)
+    by = float(by)
+    px = float(px)
+    py = float(py)
+
+    dx = bx - ax
+    dy = by - ay
+
+    denom = dx * dx + dy * dy
+
+    if denom == 0.0:
+        ddx = px - ax
+        ddy = py - ay
+        return ddx * ddx + ddy * ddy
+
+    t = ((px - ax) * dx + (py - ay) * dy) / denom
+
+    if t <= 0.0:
+        ddx = px - ax
+        ddy = py - ay
+        return ddx * ddx + ddy * ddy
+
+    if t >= 1.0:
+        ddx = px - bx
+        ddy = py - by
+        return ddx * ddx + ddy * ddy
+
+    proj_x = ax + t * dx
+    proj_y = ay + t * dy
+
+    ddx = px - proj_x
+    ddy = py - proj_y
+
+    return ddx * ddx + ddy * ddy
