@@ -1,5 +1,11 @@
 # pyskeletvectorization
 
+```commandline
+pip install numpy
+pip install numba
+```
+
+
 ```python
 import numpy as np
 import matplotlib.pyplot as plt
