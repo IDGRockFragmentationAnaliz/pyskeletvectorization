@@ -1,3 +1,5 @@
+import numpy as np
+
 def bitmask_to_3x3(bitmask: int, *, dtype=np.uint8) -> np.ndarray:
     """
     Преобразует 8-битную маску окрестности в матрицу 3x3.
