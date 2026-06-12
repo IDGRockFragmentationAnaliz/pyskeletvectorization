@@ -1,7 +1,7 @@
 import numpy as np
 from numba import njit
 from .pixel_graph import pixel_graph
-from .trace_csrgraph_paths import _trace_paths_numba
+from .trace_csrgraph_paths import _trace_paths
 
 
 def vectorize(img, return_flat=False, simplify_tolerance=1.0):
@@ -47,7 +47,7 @@ def vectorize(img, return_flat=False, simplify_tolerance=1.0):
     indptr = graph.indptr
     indices = graph.indices
 
-    points_xy, offsets = _trace_paths_numba(
+    points_xy, offsets = _trace_paths(
         indices,
         indptr,
         coords,

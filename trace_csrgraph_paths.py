@@ -3,7 +3,7 @@ from numba import njit
 from .linesimplification import douglas_peucker_inplace
 
 @njit(cache=True)
-def _trace_paths_numba(indices, indptr, coords, simplify_tolerance):
+def _trace_paths(indices, indptr, coords, simplify_tolerance):
     """
     indices : 1D array, shape (edge_ref_count,)
         CSR-массив соседей. Для неориентированного графа каждое ребро хранится дважды
@@ -43,24 +43,17 @@ def _trace_paths_numba(indices, indptr, coords, simplify_tolerance):
     offsets[0] = 0
 
     # 1. Изолированные точки
-    for node in range(node_count):
-        if important_mask[node] and degrees[node] == 0:
-            line_start = flat_count
-
-            flat_count = _append_node_point(
-                points_xy,
-                flat_count,
-                coords,
-                node,
-            )
-
-            flat_count, line_count = _finish_line(
+    for start_node in range(node_count):
+        if degrees[start_node] == 0:
+            flat_count, line_count = _trace_isolated_point(
+                start_node,
+                degrees,
                 points_xy,
                 flat_count,
                 offsets,
                 line_count,
-                line_start,
-                simplify_tolerance,
+                coords,
+                simplify_tolerance
             )
 
     # 2. Обычные линии: от важного узла до важного узла
@@ -68,164 +61,246 @@ def _trace_paths_numba(indices, indptr, coords, simplify_tolerance):
         if not important_mask[start_node]:
             continue
 
-        nb_start = indptr[start_node]
-        nb_end = indptr[start_node + 1]
-
-        for p in range(nb_start, nb_end):
-            if visited[p] != 0:
-                continue
-
-            next_node = indices[p]
-
-            line_start = flat_count
-
-            flat_count = _append_node_point(
-                points_xy,
-                flat_count,
-                coords,
-                start_node,
-            )
-
-            prev_node = start_node
-            current_node = next_node
-
-            visited[p] = 1
-            _mark_reverse_edge(
-                indptr,
-                indices,
-                visited,
-                start_node,
-                current_node,
-            )
-
-            while True:
-                flat_count = _append_node_point(
-                    points_xy,
-                    flat_count,
-                    coords,
-                    current_node,
-                )
-
-                if important_mask[current_node]:
-                    break
-
-                # current_node не важный, значит degree == 2
-                p0 = indptr[current_node]
-                p1 = p0 + 1
-
-                if indices[p0] != prev_node:
-                    p_next = p0
-                else:
-                    p_next = p1
-
-                if visited[p_next] != 0:
-                    break
-
-                new_node = indices[p_next]
-
-                visited[p_next] = 1
-                _mark_reverse_edge(
-                    indptr,
-                    indices,
-                    visited,
-                    current_node,
-                    new_node,
-                )
-
-                prev_node = current_node
-                current_node = new_node
-
-            flat_count, line_count = _finish_line(
-                points_xy,
-                flat_count,
-                offsets,
-                line_count,
-                line_start,
-                simplify_tolerance,
-            )
+        flat_count, line_count = _trace_paths_from_important_node(
+            start_node,
+            indptr,
+            indices,
+            visited,
+            degrees,
+            points_xy,
+            flat_count,
+            offsets,
+            line_count,
+            coords,
+            simplify_tolerance,
+        )
 
     # 3. Остаточные циклы.
     # Важно: это ловит кольца даже если в изображении есть и обычные линии тоже.
     for start_node in range(node_count):
-        nb_start = indptr[start_node]
-        nb_end = indptr[start_node + 1]
+        if degrees[start_node] != 2:
+            continue
 
-        for p in range(nb_start, nb_end):
-            if visited[p] != 0:
-                continue
-
-            next_node = indices[p]
-
-            line_start = flat_count
-
-            flat_count = _append_node_point(
-                points_xy,
-                flat_count,
-                coords,
-                start_node,
-            )
-
-            prev_node = start_node
-            current_node = next_node
-
-            visited[p] = 1
-            _mark_reverse_edge(
-                indptr,
-                indices,
-                visited,
-                start_node,
-                current_node,
-            )
-
-            while True:
-                flat_count = _append_node_point(
-                    points_xy,
-                    flat_count,
-                    coords,
-                    current_node,
-                )
-
-                if current_node == start_node:
-                    break
-
-                if degrees[current_node] != 2:
-                    break
-
-                p0 = indptr[current_node]
-                p1 = p0 + 1
-
-                if indices[p0] != prev_node:
-                    p_next = p0
-                else:
-                    p_next = p1
-
-                if visited[p_next] != 0:
-                    break
-
-                new_node = indices[p_next]
-
-                visited[p_next] = 1
-                _mark_reverse_edge(
-                    indptr,
-                    indices,
-                    visited,
-                    current_node,
-                    new_node,
-                )
-
-                prev_node = current_node
-                current_node = new_node
-
-            flat_count, line_count = _finish_line(
-                points_xy,
-                flat_count,
-                offsets,
-                line_count,
-                line_start,
-                simplify_tolerance,
-            )
-
+        flat_count, line_count = _trace_residual_cycles_from_node(
+            start_node,
+            indptr,
+            indices,
+            degrees,
+            visited,
+            points_xy,
+            flat_count,
+            offsets,
+            line_count,
+            coords,
+            simplify_tolerance,
+        )
     return points_xy[:flat_count].copy(), offsets[:line_count + 1].copy()
+
+
+@njit(cache=True)
+def _trace_isolated_point(
+    start_node,
+    degrees,
+    points_xy,
+    flat_count,
+    offsets,
+    line_count,
+    coords,
+    simplify_tolerance,
+):
+    """
+    Обрабатывает одну возможную изолированную точку.
+
+    Знание функции:
+        start_node считается изолированной точкой только если:
+            degrees[start_node] == 0
+    """
+
+    line_start = flat_count
+
+    flat_count = _append_node_point(
+        points_xy,
+        flat_count,
+        coords,
+        start_node,
+    )
+
+    line_count += 1
+    offsets[line_count] = flat_count
+
+    return flat_count, line_count
+
+
+@njit(cache=True)
+def _trace_paths_from_important_node(
+    start_node,
+    indptr,
+    indices,
+    visited,
+    degrees,
+    points_xy,
+    flat_count,
+    offsets,
+    line_count,
+    coords,
+    simplify_tolerance,
+):
+    """
+    Трассирует все ещё не посещённые линии, выходящие из важного узла.
+
+    Предусловие:
+        start_node — важный узел графа.
+        То есть degree(start_node) != 2.
+
+    Смысл:
+        из start_node запускаются трассы по каждому непосещённому ребру.
+        Каждая трасса идёт через degree == 2 узлы, пока не встретит
+        другой важный узел.
+    """
+
+    nb_start = indptr[start_node]
+    nb_end = indptr[start_node + 1]
+
+    for p in range(nb_start, nb_end):
+        if visited[p] != 0:
+            continue
+
+        next_node = indices[p]
+
+        line_start = flat_count
+
+        flat_count = _append_node_point(
+            points_xy,
+            flat_count,
+            coords,
+            start_node,
+        )
+
+        prev_node = start_node
+        current_node = next_node
+
+        visited[p] = 1
+        _mark_reverse_edge(
+            indptr,
+            indices,
+            visited,
+            start_node,
+            current_node,
+        )
+
+        flat_count = _trace_degree2_chain_body(
+            prev_node,
+            current_node,
+            indptr,
+            indices,
+            visited,
+            degrees,
+            points_xy,
+            flat_count,
+            coords,
+        )
+
+        line_count += 1
+        offsets[line_count] = flat_count
+
+        flat_count = _simplify_finished_line_inplace(
+            points_xy,
+            offsets,
+            line_count,
+            simplify_tolerance,
+        )
+
+    return flat_count, line_count
+
+
+@njit(cache=True)
+def _trace_residual_cycles_from_node(
+    start_node,
+    indptr,
+    indices,
+    degrees,
+    visited,
+    points_xy,
+    flat_count,
+    offsets,
+    line_count,
+    coords,
+    simplify_tolerance,
+):
+    """
+    Трассирует остаточные циклы, которые не были обработаны через важные узлы.
+
+    Предусловие:
+        start_node — узел остаточного цикла.
+        Обычно degree(start_node) == 2.
+
+    Смысл:
+        после обработки всех важных узлов непосещёнными остаются только
+        замкнутые компоненты, где нет концов и развилок.
+
+    Функция проходит по всем непосещённым рёбрам start_node.
+    Обычно в чистом цикле реально построится одна линия, а второе ребро
+    уже окажется посещённым.
+    """
+
+    nb_start = indptr[start_node]
+    nb_end = indptr[start_node + 1]
+    visited[start_node] = 1
+
+    for p in range(nb_start, nb_end):
+        if visited[p] != 0:
+            continue
+
+        # начало обработки по координатам
+        next_node = indices[p]
+
+        line_start = flat_count
+
+        flat_count = _append_node_point(
+            points_xy,
+            flat_count,
+            coords,
+            start_node,
+        )
+
+        prev_node = start_node
+        current_node = next_node
+
+        visited[p] = 1
+        _mark_reverse_edge(
+            indptr,
+            indices,
+            visited,
+            start_node,
+            current_node,
+        )
+
+        # начало цикла
+        flat_count = _trace_degree2_chain_body(
+            prev_node,
+            current_node,
+            indptr,
+            indices,
+            degrees,
+            visited,
+            points_xy,
+            flat_count,
+            coords,
+        )
+        # конец цикла
+
+        line_count += 1
+        offsets[line_count] = flat_count
+        # Конец обработки по индексам
+
+        flat_count = _simplify_finished_line_inplace(
+            points_xy,
+            offsets,
+            line_count,
+            simplify_tolerance,
+        )
+
+    return flat_count, line_count
 
 
 @njit(cache=True)
@@ -258,27 +333,19 @@ def _append_node_point(points_xy, flat_count, coords, node):
 
 
 @njit(cache=True)
-def _finish_line(
+def _simplify_finished_line_inplace(
     points_xy,
-    flat_count,
     offsets,
     line_count,
-    line_start,
     simplify_tolerance,
 ):
-    """
-    Завершает текущую линию.
-
-    Если simplify_tolerance > 0:
-        упрощает points_xy[line_start:flat_count] на месте
-        и откатывает flat_count к новой длине.
-
-    Если simplify_tolerance <= 0:
-        ничего не упрощает.
-    """
+    flat_count = offsets[line_count]
 
     if simplify_tolerance > 0.0:
-        line = points_xy[line_start:flat_count]
+        line_start = offsets[line_count - 1]
+        line_end = offsets[line_count]
+
+        line = points_xy[line_start:line_end]
 
         new_len = douglas_peucker_inplace(
             line,
@@ -286,8 +353,71 @@ def _finish_line(
         )
 
         flat_count = line_start + new_len
+        offsets[line_count] = flat_count
 
-    line_count += 1
-    offsets[line_count] = flat_count
+    return flat_count
 
-    return flat_count, line_count
+@njit(cache=True)
+def _trace_degree2_chain_body(
+    prev_node,
+    current_node,
+    indptr,
+    indices,
+    degrees,
+    visited,
+    points_xy,
+    flat_count,
+    coords,
+):
+    """
+    Трассирует цепочку через degree == 2 узлы.
+
+    На каждой итерации:
+        - добавляет current_node в points_xy;
+        - если degree[current_node] != 2, завершает трассу;
+        - выбирает следующее ребро, отличное от ребра назад;
+        - если следующее ребро уже посещено, завершает трассу;
+        - иначе помечает ребро и переходит дальше.
+
+    Работает и для:
+        - обычных линий между важными узлами;
+        - остаточных циклов.
+    """
+
+    while True:
+        flat_count = _append_node_point(
+            points_xy,
+            flat_count,
+            coords,
+            current_node,
+        )
+
+        if degrees[current_node] != 2:
+            break
+
+        p0 = indptr[current_node]
+        p1 = p0 + 1
+
+        if indices[p0] != prev_node:
+            p_next = p0
+        else:
+            p_next = p1
+
+        if visited[p_next] != 0:
+            break
+
+        new_node = indices[p_next]
+
+        visited[p_next] = 1
+        _mark_reverse_edge(
+            indptr,
+            indices,
+            visited,
+            current_node,
+            new_node,
+        )
+
+        prev_node = current_node
+        current_node = new_node
+
+    return flat_count
